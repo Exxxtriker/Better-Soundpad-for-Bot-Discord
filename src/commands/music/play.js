@@ -130,7 +130,9 @@ function isPlaylistUrl(query) {
     if (!/^https:\/\//i.test(query)) return false;
     const parsed = new URL(query);
     const hostname = parsed.hostname.toLowerCase();
-    if (hostname.includes('youtube.com')) return parsed.pathname === '/playlist';
+    if (hostname === 'youtu.be' || hostname.endsWith('youtube.com')) {
+        return parsed.pathname === '/playlist' || Boolean(parsed.searchParams.get('list'));
+    }
     if (hostname.includes('soundcloud.com')) return parsed.pathname.split('/').includes('sets');
     return false;
 }
@@ -164,6 +166,21 @@ function validateQuery(query) {
     }
 
     const hostname = parsed.hostname.toLowerCase();
+    if (hostname === 'youtu.be' || hostname.endsWith('youtube.com')) {
+        const playlistId = parsed.searchParams.get('list');
+        if (playlistId !== null) {
+            if (!/^[A-Za-z0-9_-]{2,128}$/.test(playlistId)) {
+                throw new Error('O identificador da playlist do YouTube é inválido.');
+            }
+            const videoId = hostname === 'youtu.be'
+                ? parsed.pathname.split('/').filter(Boolean)[0]
+                : parsed.searchParams.get('v');
+            if (videoId) {
+                return `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&list=${encodeURIComponent(playlistId)}`;
+            }
+            return `https://www.youtube.com/playlist?list=${encodeURIComponent(playlistId)}`;
+        }
+    }
     if (hostname === 'youtu.be') {
         const videoId = parsed.pathname.split('/').filter(Boolean)[0];
         if (videoId) return `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`;
@@ -574,6 +591,7 @@ function getPlaylistSongs(query, user) {
             '--ignore-config',
             ...cookieArgs,
             '--js-runtimes', `node:${process.execPath}`,
+            '--yes-playlist',
             '--flat-playlist',
             '--dump-single-json',
             '--playlist-end', String(MAX_MUSIC_QUEUE_SIZE + 1),

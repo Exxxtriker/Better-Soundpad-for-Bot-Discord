@@ -29,6 +29,38 @@ const SPOTIFY_SOURCE_RECOVERY_ATTEMPTS = 2;
 const DEFAULT_MUSIC_VOLUME = 100;
 const MAX_MUSIC_QUEUE_SIZE = 1_000;
 const MAX_VOICE_STATUS_LENGTH = 500;
+const MAX_YT_DLP_METADATA_PROCESSES = 2;
+
+let activeYtDlpMetadataProcesses = 0;
+const pendingYtDlpMetadata = [];
+
+function execYtDlpMetadata(file, args, options, callback) {
+    const run = () => {
+        activeYtDlpMetadataProcesses += 1;
+        const finish = (...result) => {
+            activeYtDlpMetadataProcesses -= 1;
+            const next = pendingYtDlpMetadata.shift();
+            if (next) next();
+            callback(...result);
+        };
+        try {
+            execFile(file, args, options, finish);
+        } catch (error) {
+            finish(error, '', '');
+        }
+    };
+    if (activeYtDlpMetadataProcesses < MAX_YT_DLP_METADATA_PROCESSES) run();
+    else pendingYtDlpMetadata.push(run);
+}
+
+function isProcessResourceError(error) {
+    const details = [error?.message, error?.details, error?.cause?.message]
+        .filter(Boolean).join('\n');
+    return error?.code === 'PROCESS_RESOURCE_EXHAUSTED'
+        || ['ENOMEM', 'EAGAIN'].includes(error?.code)
+        || (error?.code === 'UNKNOWN' && error?.syscall === 'spawn' && Number(error?.errno) === -4094)
+        || /failed to create child process|insufficient (?:memory|system resources)|recursos de mem[oó]ria.*insuficientes/i.test(details);
+}
 
 // ─── Fila por guild ───────────────────────────────────────────────
 const guildQueues = new Map(); // guildId -> { songs[], player, connection, playing }
@@ -430,7 +462,7 @@ function getSongInfo(query, options = {}) {
         const { useCookies = true, timeoutMs = 60_000 } = options;
         const input = /^https:\/\//i.test(query) ? query : `ytsearch1:${query}`;
         const cookieArgs = useCookies ? ['--cookies', COOKIES_PATH] : [];
-        execFile(YT_DLP_PATH, [
+        execYtDlpMetadata(YT_DLP_PATH, [
             '--ignore-config',
             ...cookieArgs,
             '--js-runtimes', `node:${process.execPath}`,
@@ -473,7 +505,7 @@ function getSongInfo(query, options = {}) {
 function searchYouTubeCandidates(query, options = {}) {
     const {
         limit = SPOTIFY_SEARCH_LIMIT,
-        execute = execFile,
+        execute = execYtDlpMetadata,
     } = options;
     const safeLimit = Math.max(1, Math.min(20, Math.floor(limit)));
     return new Promise((resolve, reject) => {
@@ -587,7 +619,7 @@ function getPlaylistSongs(query, user) {
         const cookieArgs = detectMusicPlatform(query) === 'YouTube'
             ? ['--cookies', COOKIES_PATH]
             : [];
-        execFile(YT_DLP_PATH, [
+        execYtDlpMetadata(YT_DLP_PATH, [
             '--ignore-config',
             ...cookieArgs,
             '--js-runtimes', `node:${process.execPath}`,
@@ -664,7 +696,7 @@ function createSoundCloudQueueSongs(info, user) {
 
 async function getSoundCloudSongs(query, user, helpers = {}) {
     const resolveUrl = helpers.resolveUrl ?? resolveSoundCloudUrl;
-    const execute = helpers.execFile ?? execFile;
+    const execute = helpers.execFile ?? execYtDlpMetadata;
     const resolvedUrl = await resolveUrl(query);
     const personalized = /\/discover\/sets\/personalized-tracks::/i.test(new URL(resolvedUrl).pathname);
 
@@ -810,50 +842,60 @@ function createYtStream(song, spawnProcess = spawn) {
             ? ['--cookies', COOKIES_PATH]
             : [];
 
-        const ytdlp = spawnProcess(YT_DLP_PATH, [
-            '--ignore-config',
-            ...cookieArgs,
-            '--js-runtimes', `node:${process.execPath}`,
-            '-f', 'bestaudio/best',
-            '--no-playlist',
-            '--socket-timeout', '20',
-            '--retries', '8',
-            '--fragment-retries', '8',
-            '--extractor-retries', '3',
-            '--file-access-retries', '3',
-            '--retry-sleep', 'http:1',
-            '--retry-sleep', 'fragment:1',
-            '--no-warnings',
-            '--quiet',
-            '-o', '-',
-            fallbackInput,
-        ]);
-        const fallbackFfmpeg = spawnProcess(ffmpegPath, [
-            '-nostdin',
-            '-loglevel', 'error',
-            '-re',
-            '-i', 'pipe:0',
-            '-vn',
-            '-f', 's16le',
-            '-ar', '48000',
-            '-ac', '2',
-            'pipe:1',
-        ]);
-        let downloadBytes = 0;
-        let decodedBytes = 0;
-        let downloadExitCode;
-        let decoderExitCode;
-        let downloadError = '';
-        let decoderError = '';
-        processes.ytdlp = ytdlp;
-        processes.ffmpeg = fallbackFfmpeg;
-
         const fail = (error) => {
             if (processes.cancelled || processes.failed) return;
             registerPlaybackFailure(error);
             processes.cancel();
             if (!output.destroyed && !output.writableEnded) output.end();
         };
+        let ytdlp;
+        let fallbackFfmpeg;
+        try {
+            ytdlp = spawnProcess(YT_DLP_PATH, [
+                '--ignore-config',
+                ...cookieArgs,
+                '--js-runtimes', `node:${process.execPath}`,
+                '-f', 'bestaudio/best',
+                '--no-playlist',
+                '--socket-timeout', '20',
+                '--retries', '8',
+                '--fragment-retries', '8',
+                '--extractor-retries', '3',
+                '--file-access-retries', '3',
+                '--retry-sleep', 'http:1',
+                '--retry-sleep', 'fragment:1',
+                '--no-warnings',
+                '--quiet',
+                '-o', '-',
+                fallbackInput,
+            ]);
+            processes.ytdlp = ytdlp;
+            ytdlp.on('error', fail);
+            fallbackFfmpeg = spawnProcess(ffmpegPath, [
+                '-nostdin',
+                '-loglevel', 'error',
+                '-re',
+                '-i', 'pipe:0',
+                '-vn',
+                '-f', 's16le',
+                '-ar', '48000',
+                '-ac', '2',
+                'pipe:1',
+            ]);
+            processes.ffmpeg = fallbackFfmpeg;
+        } catch (error) {
+            registerPlaybackFailure(error);
+            processes.cancel();
+            output.end();
+            return;
+        }
+        let downloadBytes = 0;
+        let decodedBytes = 0;
+        let downloadExitCode;
+        let decoderExitCode;
+        let downloadError = '';
+        let decoderError = '';
+
         const fallbackStartTimer = processes.setTimer(() => {
             fail(new Error('O áudio demorou demais para começar no modo compatível.'));
         }, FALLBACK_STREAM_START_TIMEOUT);
@@ -905,7 +947,6 @@ function createYtStream(song, spawnProcess = spawn) {
         ytdlp.stderr.on('data', (data) => {
             downloadError = `${downloadError}${data}`.slice(-4_000);
         });
-        ytdlp.on('error', fail);
         ytdlp.on('close', (code) => {
             if (processes.cancelled) return;
             downloadExitCode = code;
@@ -946,7 +987,6 @@ function createYtStream(song, spawnProcess = spawn) {
     directStartTimer = processes.setTimer(() => {
         if (processes.cancelled || directFinished || directBytes > 0) return;
         ffmpeg.kill();
-        startFallback();
     }, DIRECT_STREAM_START_TIMEOUT);
 
     ffmpeg.stdout.on('error', (error) => {
@@ -961,8 +1001,13 @@ function createYtStream(song, spawnProcess = spawn) {
         directError = `${directError}${data}`.slice(-4_000);
     });
     ffmpeg.on('error', (error) => {
-        console.error('Falha ao iniciar FFmpeg:', error);
-        if (!directFinished && directBytes === 0) startFallback();
+        if (isProcessResourceError(error)) {
+            registerPlaybackFailure(error);
+            processes.cancel();
+            output.end();
+        } else {
+            console.error('Falha ao iniciar FFmpeg:', error);
+        }
     });
     ffmpeg.on('close', (code) => {
         if (directFinished) return;
@@ -1128,7 +1173,6 @@ async function playNext(guildId) {
     queue.paused = false;
 
     const currentResolution = resolveSongForPlayback(song);
-    prefetchNextSong(queue);
     await currentResolution;
     if (guildQueues.get(guildId) !== queue || queue.songs[0] !== song) return;
 
@@ -1162,6 +1206,21 @@ async function playNextAvailable(guildId, starter = playNext) {
             const playbackError = error instanceof Error ? error : new Error(String(error));
             playbackError.platform ??= getSongPlatform(song);
             playbackError.track ??= title;
+            if (isProcessResourceError(playbackError)) {
+                console.error(`Erro de recursos ao preparar "${title}"; fila preservada:`, playbackError);
+                stopProcesses(queue);
+                queue.paused = true;
+                await Promise.all([
+                    updateMessage(guildId),
+                    setVoiceChannelStatus(queue.voiceChannel, null),
+                ]);
+                const resourceError = new Error(
+                    'O Windows ficou sem recursos para iniciar yt-dlp/FFmpeg. A fila foi preservada; libere memória e tente novamente.',
+                    { cause: playbackError },
+                );
+                resourceError.code = 'PROCESS_RESOURCE_EXHAUSTED';
+                throw resourceError;
+            }
             console.error(`Erro ao preparar "${title}"; avançando a fila:`, playbackError);
             stopProcesses(queue);
             const failedSong = queue.songs.shift();
@@ -1367,6 +1426,15 @@ async function createQueue(guild, voiceChannel) {
                 const failedProcesses = q.currentProcesses;
                 const playbackFailed = failedProcesses?.failed;
                 const failedSong = q.songs[0];
+                if (playbackFailed && isProcessResourceError(failedProcesses.failure)) {
+                    stopProcesses(q);
+                    q.paused = true;
+                    await Promise.all([
+                        updateMessage(guild.id),
+                        setVoiceChannelStatus(q.voiceChannel, null),
+                    ]);
+                    return;
+                }
                 const shouldRecoverSource = playbackFailed
                     && prepareSpotifySourceRecovery(failedSong, failedProcesses.failure);
                 stopProcesses(q);
@@ -1545,6 +1613,11 @@ module.exports = {
                 response = '❌ Este vídeo possui restrição de idade. Atualize os cookies com uma conta apta a assisti-lo.';
             } else if (unavailable) {
                 response = '❌ Esse vídeo do YouTube está indisponível ou foi removido.';
+            } else if (isProcessResourceError(error)) {
+                const hasQueue = guildQueues.get(guildId)?.songs?.length > 0;
+                response = hasQueue
+                    ? '❌ O Windows não conseguiu iniciar o áudio por falta de recursos. A fila foi mantida; libere memória e use **Continuar** no painel para tentar de novo.'
+                    : '❌ O Windows não conseguiu iniciar o áudio por falta de recursos. Libere memória e tente o comando novamente.';
             }
             if (interaction.deferred || interaction.replied) await interaction.editReply(response);
             else await interaction.reply({ content: response, flags: 64 });

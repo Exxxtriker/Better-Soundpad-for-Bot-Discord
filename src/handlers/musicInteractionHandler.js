@@ -1,8 +1,10 @@
+const { AudioPlayerStatus } = require('@discordjs/voice');
 const {
     advanceCustomQueue,
     getPlatformIcon,
     guildQueues,
     prefetchNextSong,
+    playNextAvailable,
     stopCustomQueue,
     updateMessage,
 } = require('../commands/music/play');
@@ -43,9 +45,21 @@ module.exports = async (interaction) => {
     try {
         switch (interaction.customId) {
         case 'music_pause':
-            if (queue.paused) queue.player.unpause();
-            else queue.player.pause();
-            queue.paused = !queue.paused;
+            if (queue.paused && queue.player.state.status === AudioPlayerStatus.Idle && queue.songs.length) {
+                if (queue.starting) throw new Error('A fila já está sendo preparada.');
+                queue.starting = true;
+                try {
+                    await playNextAvailable(guildId);
+                } finally {
+                    queue.starting = false;
+                }
+            } else if (queue.paused) {
+                queue.player.unpause();
+                queue.paused = false;
+            } else {
+                queue.player.pause();
+                queue.paused = true;
+            }
             await updateMessage(guildId);
             break;
 

@@ -1,13 +1,13 @@
 const { AudioPlayerStatus } = require('@discordjs/voice');
 const {
     advanceCustomQueue,
-    getPlatformIcon,
     guildQueues,
     prefetchNextSong,
     playNextAvailable,
     stopCustomQueue,
     updateMessage,
 } = require('../commands/music/play');
+const { openMusicQueue } = require('./musicQueueMenu');
 
 const MUSIC_BUTTONS = new Set([
     'music_prev',
@@ -95,17 +95,9 @@ module.exports = async (interaction) => {
             await updateMessage(guildId);
             break;
 
-        case 'music_queue': {
-            const songs = queue.songs ?? [];
-            if (songs.length === 0) throw new Error('A fila está vazia.');
-            const list = songs.slice(0, 10).map((song, index) => {
-                const position = index === 0 ? '▶️' : `\`${index}.\``;
-                return `${position} ${getPlatformIcon(song)} **${song.title ?? song.name}** \`${song.formattedDuration ?? '?:??'}\``;
-            }).join('\n');
-            const extra = songs.length > 10 ? `\n...e mais **${songs.length - 10}** músicas.` : '';
-            await interaction.followUp({ content: `🎶 **Fila atual:**\n${list}${extra}`, flags: 64 });
+        case 'music_queue':
+            await openMusicQueue(interaction);
             break;
-        }
 
         default:
             break;

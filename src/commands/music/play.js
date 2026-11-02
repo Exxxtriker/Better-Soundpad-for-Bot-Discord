@@ -28,8 +28,17 @@ const SPOTIFY_CANDIDATE_ATTEMPTS = 4;
 const SPOTIFY_SOURCE_RECOVERY_ATTEMPTS = 2;
 const DEFAULT_MUSIC_VOLUME = 100;
 const MAX_MUSIC_QUEUE_SIZE = 1_000;
+const MAX_MUSIC_HISTORY_SIZE = 100;
 const MAX_VOICE_STATUS_LENGTH = 500;
 const MAX_YT_DLP_METADATA_PROCESSES = 2;
+
+function rememberSong(queue, song) {
+    if (!song) return;
+    queue.history.push(song);
+    if (queue.history.length > MAX_MUSIC_HISTORY_SIZE) {
+        queue.history.splice(0, queue.history.length - MAX_MUSIC_HISTORY_SIZE);
+    }
+}
 
 let activeYtDlpMetadataProcesses = 0;
 const pendingYtDlpMetadata = [];
@@ -1224,7 +1233,8 @@ async function playNextAvailable(guildId, starter = playNext) {
             console.error(`Erro ao preparar "${title}"; avançando a fila:`, playbackError);
             stopProcesses(queue);
             const failedSong = queue.songs.shift();
-            if (failedSong) queue.history.push(failedSong);
+            if (queue.prioritySong === failedSong) queue.prioritySong = null;
+            rememberSong(queue, failedSong);
             return tryNextSong(remainingAttempts - 1);
         }
     };
@@ -1336,24 +1346,59 @@ async function stopCustomQueue(guildId) {
 
 async function advanceCustomQueue(guildId, direction = 'next') {
     const queue = guildQueues.get(guildId);
-    if (!queue || queue.transitioning) return false;
+    if (!queue || queue.transitioning || queue.starting) return false;
     if (direction === 'previous' && queue.history.length === 0) return false;
+    if (direction === 'previous' && queue.songs.length >= MAX_MUSIC_QUEUE_SIZE) {
+        throw new Error('A fila está cheia. Remova uma faixa antes de voltar à anterior.');
+    }
 
     queue.transitioning = true;
     try {
         stopProcesses(queue);
+        queue.prioritySong = null;
         if (direction === 'previous') {
             const previous = queue.history.pop();
             queue.songs.unshift(previous);
         } else {
             const current = queue.songs.shift();
-            if (current) queue.history.push(current);
+            rememberSong(queue, current);
         }
         await playNextAvailable(guildId);
         return true;
     } finally {
         const activeQueue = guildQueues.get(guildId);
         if (activeQueue) activeQueue.transitioning = false;
+    }
+}
+
+async function prioritizeQueuedSong(guildId, song, helpers = {}) {
+    const queue = guildQueues.get(guildId);
+    if (!queue || !queue.songs.includes(song)) {
+        throw Object.assign(new Error('Essa faixa não está mais nesta fila. Atualize a seleção.'), { code: 'MUSIC_QUEUE_CHANGED' });
+    }
+    if (queue.transitioning || queue.starting) {
+        throw Object.assign(new Error('A fila está trocando de música. Aguarde um instante e tente novamente.'), { code: 'MUSIC_QUEUE_BUSY' });
+    }
+    const index = queue.songs.indexOf(song);
+    if (index === 0) {
+        throw Object.assign(new Error('Essa faixa já está tocando.'), { code: 'MUSIC_TRACK_CURRENT' });
+    }
+
+    queue.transitioning = true;
+    queue.starting = true;
+    try {
+        stopProcesses(queue);
+        queue.songs.splice(index, 1);
+        rememberSong(queue, queue.songs.shift());
+        queue.songs.unshift(song);
+        queue.prioritySong = song;
+        queue.player.stop(true);
+        const start = helpers.playNext ?? playNextAvailable;
+        await start(guildId);
+        return guildQueues.get(guildId) === queue && queue.songs[0] === song;
+    } finally {
+        queue.transitioning = false;
+        queue.starting = false;
     }
 }
 
@@ -1395,6 +1440,7 @@ async function createQueue(guild, voiceChannel) {
         history: [],
         currentProcesses: null,
         currentResource: null,
+        prioritySong: null,
         transitioning: false,
         voiceChannel,
     };
@@ -1452,11 +1498,13 @@ async function createQueue(guild, voiceChannel) {
                         failedProcesses.failure,
                     );
                 }
+                const wasPrioritySong = q.prioritySong === failedSong;
+                q.prioritySong = null;
                 if (!playbackFailed && q.loop === 'queue' && q.songs.length > 0) {
                     q.songs.push(q.songs.shift());
-                } else if (playbackFailed || q.loop !== 'song') {
+                } else if (wasPrioritySong || playbackFailed || q.loop !== 'song') {
                     const finished = q.songs.shift();
-                    if (finished) q.history.push(finished);
+                    rememberSong(q, finished);
                 }
                 await playNextAvailable(guild.id);
             } finally {
@@ -1519,14 +1567,20 @@ async function ensureQueue(guild, voiceChannel) {
 }
 
 async function enqueueSongs(guild, voiceChannel, songs, helpers = {}) {
+    if (songs.length > MAX_MUSIC_QUEUE_SIZE) {
+        throw Object.assign(new Error(`A fila aceita no máximo ${MAX_MUSIC_QUEUE_SIZE} faixas.`), { code: 'MUSIC_QUEUE_FULL' });
+    }
     const ensure = helpers.ensureQueue ?? ensureQueue;
     const start = helpers.playNext ?? playNextAvailable;
     const prefetch = helpers.prefetchNextSong ?? prefetchNextSong;
     const refresh = helpers.updateMessage ?? updateMessage;
     const queue = await ensure(guild, voiceChannel);
+    if (queue.songs.length + songs.length > MAX_MUSIC_QUEUE_SIZE) {
+        throw Object.assign(new Error(`A fila aceita no máximo ${MAX_MUSIC_QUEUE_SIZE} faixas. Há ${Math.max(0, MAX_MUSIC_QUEUE_SIZE - queue.songs.length)} vaga(s) disponível(is).`), { code: 'MUSIC_QUEUE_FULL' });
+    }
     queue.songs.push(...songs);
 
-    if (queue.player.state.status === AudioPlayerStatus.Idle && !queue.starting) {
+    if (queue.player.state.status === AudioPlayerStatus.Idle && !queue.starting && !queue.transitioning) {
         queue.starting = true;
         try {
             await start(guild.id);
@@ -1613,6 +1667,8 @@ module.exports = {
                 response = '❌ Este vídeo possui restrição de idade. Atualize os cookies com uma conta apta a assisti-lo.';
             } else if (unavailable) {
                 response = '❌ Esse vídeo do YouTube está indisponível ou foi removido.';
+            } else if (error?.code === 'MUSIC_QUEUE_FULL') {
+                response = `❌ ${error.message}`;
             } else if (isProcessResourceError(error)) {
                 const hasQueue = guildQueues.get(guildId)?.songs?.length > 0;
                 response = hasQueue
@@ -1638,7 +1694,9 @@ module.exports = {
     playNext,
     playNextAvailable,
     enqueueSongs,
+    rememberSong,
     advanceCustomQueue,
+    prioritizeQueuedSong,
     isMusicActive,
     stopCustomQueue,
     formatDuration,

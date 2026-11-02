@@ -42,6 +42,10 @@ Gideon é um bot multitarefa para Discord criado para acompanhar campanhas de RP
 
 `/play` e `/soundpad` são mutuamente exclusivos em cada servidor: enquanto um player estiver ativo, o outro ficará bloqueado. O bot encerra a sessão e o menu quando a fila fica inativa ou não existem mais usuários no canal de voz.
 
+A fila do `/play` aceita até 1.000 faixas no total. O histórico do botão anterior conserva as últimas 100 faixas.
+
+No botão **Pergaminho**, navegue pelas páginas e selecione uma música para tocar imediatamente. Ela sai da posição antiga, a faixa interrompida vai para o histórico e as demais continuam na mesma ordem. A seleção toca uma vez antes de retomar o restante, mesmo com o loop de uma faixa ativado.
+
 ### RPG, perfil e economia
 
 | Comando | Função |
@@ -86,7 +90,7 @@ Os pacotes possuem probabilidades próprias por categoria e raridade. Pacotes es
 
 ## Requisitos
 
-- [Node.js](https://nodejs.org/) 20 ou superior.
+- [Node.js](https://nodejs.org/) 22.12 ou superior.
 - Uma aplicação configurada no [Discord Developer Portal](https://discord.com/developers/applications).
 - Uma instância do MongoDB, local ou no MongoDB Atlas.
 - No Windows, permissão para executar o `yt-dlp.exe` incluído no projeto.

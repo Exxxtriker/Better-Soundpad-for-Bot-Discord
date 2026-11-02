@@ -232,6 +232,7 @@ class AudioPlayerManager {
                             mixer.setLayer('background', audioPath);
                             return;
                         } catch (error) {
+                            this.loopEnabled = false;
                             console.error('Erro ao reiniciar trilha do soundpad:', error);
                         }
                     }
@@ -262,7 +263,16 @@ class AudioPlayerManager {
         if (this.destroyed) return;
         const firstLayer = !this.mixer || this.mixer.finished;
         const mixer = firstLayer ? this.createMixer() : this.mixer;
-        mixer.setLayer(layer, audioPath);
+        try {
+            mixer.setLayer(layer, audioPath);
+        } catch (error) {
+            if (firstLayer) {
+                mixer.destroy();
+                this.mixer = null;
+                this.currentResource = null;
+            }
+            throw error;
+        }
         if (layer === 'background') this.backgroundAudioName = audioName;
         else this.effectAudioName = audioName;
         if (firstLayer) this.player.play(this.currentResource);

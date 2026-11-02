@@ -162,6 +162,7 @@ module.exports = {
         .setDMPermission(false),
 
     async execute(interaction) {
+        await interaction.deferReply();
         const packType = interaction.options.getString('pacote', true);
         const result = await openPack(
             interaction.guildId,
@@ -171,19 +172,17 @@ module.exports = {
         );
 
         if (result.status === 'empty') {
-            return interaction.reply({
+            return interaction.editReply({
                 content: `❌ Você não possui nenhum **${PACK_NAMES[packType]}**.`,
-                flags: 64,
             });
         }
         if (result.status === 'full') {
-            return interaction.reply({
+            return interaction.editReply({
                 content: [
                     `🎒 Você precisa de **${result.requiredSlots} espaços livres** para abrir o pacote`,
                     `(**${result.cardTotal}/${result.capacity}**).`,
                     'Compre uma **Bolsa de Cartas** no /mercador.',
                 ].join(' '),
-                flags: 64,
             });
         }
 
@@ -201,7 +200,7 @@ module.exports = {
         );
         const slides = [...collectibleReveals, jokerReveal];
         const position = 0;
-        await interaction.reply(slidePayload(slides[position], position));
+        await interaction.editReply(slidePayload(slides[position], position));
         await registerCarousel(interaction, {
             total: slides.length,
             render: (nextPosition) => slidePayload(slides[nextPosition], nextPosition),

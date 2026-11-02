@@ -78,6 +78,8 @@ const HELP_PAGES = [
             '`/soundpad` — Reproduz trilhas e efeitos simultâneos, com volume próprio para cada camada.',
             '',
             'Os players possuem fila, pausa, pular, voltar e loop.',
+            'No **Pergaminho** do /play, navegue pela fila e escolha uma faixa para tocar agora.',
+            'As outras músicas mantêm a ordem; a faixa interrompida fica no histórico.',
             'Também controlam volume e encerramento automático.',
             '',
             '`/play` e `/soundpad` são exclusivos.',

@@ -17,6 +17,8 @@ const { token } = require('./config');
 const { stopActivityRotation } = require('./src/events/botOn');
 const { configureDnsResolver, PUBLIC_DNS_SERVERS } = require('./src/utils/dnsResolver');
 const { loginWithRetry } = require('./src/utils/discordLogin');
+const { guildQueues, stopCustomQueue } = require('./src/commands/music/play');
+const activePlayers = require('./src/handlers/activePlayers');
 /* eslint-enable import/order */
 
 const MONGO_OPTIONS = { serverSelectionTimeoutMS: 10_000 };
@@ -81,10 +83,38 @@ async function connectMongo() {
     }
 }
 
+async function shutdown() {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    startupAbortController.abort();
+    stopActivityRotation(client);
+    for (const manager of activePlayers.values()) {
+        try {
+            manager.destroy?.({ deleteMessage: true });
+        } catch (error) {
+            console.error('Erro ao encerrar soundpad:', error);
+        }
+    }
+    const results = await Promise.allSettled([...guildQueues.keys()].map(stopCustomQueue));
+    results.forEach((result) => {
+        if (result.status === 'rejected') console.error('Erro ao encerrar fila de música:', result.reason);
+    });
+    try {
+        await client.destroy();
+    } catch (error) {
+        console.error('Erro ao encerrar o cliente Discord:', error);
+    }
+    await mongoose.disconnect().catch((error) => console.error('Erro ao desconectar MongoDB:', error));
+}
+
 async function start() {
     try {
         if (!process.env.MONGO_URI) throw new Error('Variável de ambiente ausente: MONGO_URI');
         await connectMongo();
+        if (shuttingDown) {
+            await mongoose.disconnect();
+            return;
+        }
         registerRuntimeErrorSources({ databaseConnection: mongoose.connection });
         await loginWithRetry(client, token, {
             signal: startupAbortController.signal,
@@ -97,20 +127,8 @@ async function start() {
         if (shuttingDown) return;
         reportCriticalError('Falha ao iniciar o bot:', error);
         process.exitCode = 1;
+        await shutdown();
     }
-}
-
-async function shutdown() {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    startupAbortController.abort();
-    stopActivityRotation(client);
-    try {
-        await client.destroy();
-    } catch (error) {
-        console.error('Erro ao encerrar o cliente Discord:', error);
-    }
-    await mongoose.disconnect().catch((error) => console.error('Erro ao desconectar MongoDB:', error));
 }
 
 process.once('SIGINT', shutdown);

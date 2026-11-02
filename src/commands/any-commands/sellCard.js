@@ -22,6 +22,7 @@ const {
     resolveCardInstance,
 } = require('../../utils/cardCatalog');
 const { getProfile, withProfileLock } = require('../../utils/profileManager');
+const { guardComponentHandler } = require('../../utils/componentHandler');
 
 const moneyFormatter = new Intl.NumberFormat('pt-BR');
 const SALE_CONFIRM_ID = 'sellcard_confirm';
@@ -111,15 +112,17 @@ async function sellCard(guildId, userId, identifier, ProfileModel = Profile) {
         const value = getCardValue(card, instance.float);
 
         removeCardInstances(profile, [instance.uid]);
-        profile.money = Math.max(0, Number(profile.money) || 0) + value;
+        // O crédito e a remoção da carta pertencem à mesma gravação atômica.
+        profile.$inc('money', value);
         await profile.save();
+        const updatedBalance = await ProfileModel.findOne({ guildId, userId }, { money: 1 });
 
         return {
             status: 'sold',
             card,
             instance,
             value,
-            balance: profile.money,
+            balance: updatedBalance.money,
         };
     });
 }
@@ -164,30 +167,29 @@ module.exports = {
     },
 
     async execute(interaction) {
+        await interaction.deferReply();
         const identifier = interaction.options.getString('carta', true);
         const profile = await getProfile(interaction.guildId, interaction.user.id);
         const instance = resolveCardInstance(profile, identifier);
 
         if (!instance) {
-            return interaction.reply({
+            return interaction.editReply({
                 content: '❌ Essa cópia não está mais no seu álbum.',
-                flags: 64,
             });
         }
         if (isCardMarried(profile, instance.uid)) {
-            return interaction.reply({
+            return interaction.editReply({
                 content: '💍 Uma carta com vínculo não pode ser vendida.',
-                flags: 64,
             });
         }
 
         const card = getCard(instance.cardId);
         if (!card) {
-            return interaction.reply({ content: '❌ Essa carta não existe no códice.', flags: 64 });
+            return interaction.editReply({ content: '❌ Essa carta não existe no códice.' });
         }
 
         const preview = buildSalePreview(interaction.user, card, instance);
-        await interaction.reply({
+        await interaction.editReply({
             embeds: [preview.embed],
             components: [buildSaleControls()],
             files: preview.files,
@@ -195,13 +197,19 @@ module.exports = {
         const message = await interaction.fetchReply();
         const collector = message.createMessageComponentCollector({ time: 60_000 });
         let finished = false;
+        let processing = false;
 
-        collector.on('collect', async (componentInteraction) => {
+        collector.on('collect', guardComponentHandler(async (componentInteraction) => {
             if (componentInteraction.user.id !== interaction.user.id) {
                 await componentInteraction.reply({
                     content: '❌ Somente o dono da carta pode decidir esta venda.',
                     flags: 64,
                 }).catch(() => {});
+                return;
+            }
+
+            if (finished || processing) {
+                await componentInteraction.deferUpdate();
                 return;
             }
 
@@ -215,12 +223,18 @@ module.exports = {
                 return;
             }
 
-            await componentInteraction.deferUpdate();
-            const result = await sellCard(
-                interaction.guildId,
-                interaction.user.id,
-                identifier,
-            );
+            processing = true;
+            let result;
+            try {
+                await componentInteraction.deferUpdate();
+                result = await sellCard(
+                    interaction.guildId,
+                    interaction.user.id,
+                    identifier,
+                );
+            } finally {
+                processing = false;
+            }
             finished = true;
             collector.stop(result.status);
 
@@ -249,7 +263,7 @@ module.exports = {
                 components: [],
                 attachments: [],
             });
-        });
+        }, 'Erro no painel de venda de cartas:'));
 
         collector.on('end', async () => {
             if (finished) return;

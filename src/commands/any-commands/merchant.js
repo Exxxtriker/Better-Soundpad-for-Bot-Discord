@@ -817,6 +817,7 @@ module.exports = {
         .setDMPermission(false),
 
     async execute(interaction) {
+        await interaction.deferReply({ flags: 64 });
         const userId = interaction.user.id;
         const { guildId } = interaction;
         const dayKey = getDailyOfferKey();
@@ -838,9 +839,8 @@ module.exports = {
                     { new: true, upsert: true, setDefaultsOnInsert: true },
                 );
             }
-            await interaction.reply({
+            await interaction.editReply({
                 ...renderLobby(profile, interaction.user),
-                flags: 64,
             });
             const reply = await interaction.fetchReply();
             collector = reply.createMessageComponentCollector({
@@ -850,13 +850,14 @@ module.exports = {
 
             collector.on('collect', async (componentInteraction) => {
                 try {
+                    await componentInteraction.deferUpdate();
                     if (componentInteraction.customId === 'merchant_category') {
                         [category] = componentInteraction.values;
                         const offerCount = category === 'cards' ? CARD_ITEMS.length : 6;
                         offers = getDailyOffers(new Date(), offerCount, category);
                         selectedItem = undefined;
                         stockStates = await getStockStates(guildId, dayKey, offers);
-                        await componentInteraction.update(renderShop(
+                        await componentInteraction.editReply(renderShop(
                             profile,
                             interaction.user,
                             offers,
@@ -870,11 +871,10 @@ module.exports = {
                     if (componentInteraction.customId === 'merchant_item') {
                         selectedItem = offers.find((item) => item.id === componentInteraction.values[0]);
                         if (!selectedItem) {
-                            await componentInteraction.deferUpdate();
                             return;
                         }
                         stockStates = await getStockStates(guildId, dayKey, offers);
-                        await componentInteraction.update(renderItem(
+                        await componentInteraction.editReply(renderItem(
                             profile,
                             selectedItem,
                             stockStates.get(selectedItem.id),
@@ -888,14 +888,14 @@ module.exports = {
                         selectedItem = undefined;
                         offers = [];
                         stockStates = new Map();
-                        await componentInteraction.update(renderLobby(profile, interaction.user));
+                        await componentInteraction.editReply(renderLobby(profile, interaction.user));
                         return;
                     }
 
                     if (componentInteraction.customId === 'merchant_back') {
                         selectedItem = undefined;
                         stockStates = await getStockStates(guildId, dayKey, offers);
-                        await componentInteraction.update(renderShop(
+                        await componentInteraction.editReply(renderShop(
                             profile,
                             interaction.user,
                             offers,
@@ -907,26 +907,26 @@ module.exports = {
                     }
 
                     if (componentInteraction.customId !== 'merchant_pay' || !selectedItem) {
-                        await componentInteraction.deferUpdate();
                         return;
                     }
 
+                    const purchasedItem = selectedItem;
                     const result = await purchaseItem({
                         guildId,
                         dayKey,
                         userId,
                         username: interaction.user.username,
-                        item: selectedItem,
+                        item: purchasedItem,
                     });
                     if (result.profile) profile = result.profile;
                     stockStates = await getStockStates(guildId, dayKey, offers);
 
-                    await componentInteraction.update(renderShop(
+                    await componentInteraction.editReply(renderShop(
                         profile,
                         interaction.user,
                         offers,
                         stockStates,
-                        createPurchaseMessage(selectedItem, result),
+                        createPurchaseMessage(purchasedItem, result),
                         category,
                     ));
                     selectedItem = undefined;

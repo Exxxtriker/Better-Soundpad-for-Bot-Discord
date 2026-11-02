@@ -22,6 +22,7 @@ const {
     resolveCardInstance,
 } = require('../../utils/cardCatalog');
 const { getProfile } = require('../../utils/profileManager');
+const { guardComponentHandler } = require('../../utils/componentHandler');
 
 function createTradeError(code) {
     const error = new Error(code);
@@ -243,6 +244,7 @@ module.exports = {
                 flags: 64,
             });
         }
+        await interaction.deferReply();
         const [senderProfile, recipientProfile] = await Promise.all([
             getProfile(interaction.guildId, interaction.user.id),
             getProfile(interaction.guildId, recipient.id),
@@ -254,13 +256,11 @@ module.exports = {
         if (!offeredCard || !requestedCard || !offeredInstance || !requestedInstance
             || isCardMarried(senderProfile, offeredInstance.uid)
             || isCardMarried(recipientProfile, requestedInstance.uid)) {
-            return interaction.reply({
+            return interaction.editReply({
                 content: '❌ Uma das cartas selecionadas não está disponível para troca.',
-                flags: 64,
             });
         }
 
-        await interaction.deferReply();
         const pendingEmbed = buildTradeEmbed(
             interaction.user,
             recipient,
@@ -279,7 +279,7 @@ module.exports = {
         let settled = false;
         const collector = message.createMessageComponentCollector({ time: 120_000 });
 
-        collector.on('collect', async (componentInteraction) => {
+        collector.on('collect', guardComponentHandler(async (componentInteraction) => {
             const isParticipant = [interaction.user.id, recipient.id].includes(componentInteraction.user.id);
             if (!isParticipant) {
                 await componentInteraction.reply({
@@ -320,8 +320,10 @@ module.exports = {
                 return;
             }
 
-            settled = true;
             await componentInteraction.deferUpdate();
+            if (settled) return;
+            settled = true;
+            let committed = false;
             try {
                 await tradeCards({
                     guildId: interaction.guildId,
@@ -330,6 +332,7 @@ module.exports = {
                     offeredInstanceId: offeredInstance.uid,
                     requestedInstanceId: requestedInstance.uid,
                 });
+                committed = true;
                 collector.stop('accepted');
                 await interaction.editReply({
                     embeds: [buildTradeEmbed(
@@ -344,6 +347,7 @@ module.exports = {
                     components: [],
                 });
             } catch (error) {
+                if (committed) throw error;
                 collector.stop('failed');
                 if (!['OFFER_UNAVAILABLE', 'REQUEST_UNAVAILABLE'].includes(error.code)) {
                     console.error('Erro ao trocar cartas:', error);
@@ -361,7 +365,7 @@ module.exports = {
                     components: [],
                 });
             }
-        });
+        }, 'Erro no painel de troca de cartas:'));
 
         collector.on('end', async (_, reason) => {
             if (settled || reason !== 'time') return;

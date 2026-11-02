@@ -50,7 +50,7 @@ class PcmLayer {
             onData();
         });
         this.process.stdout.on('end', () => {
-            this.ended = true;
+            // Só o fechamento do processo confirma se o EOF foi sucesso ou falha.
             onData();
         });
         this.process.stdout.on('error', (error) => {
@@ -146,7 +146,14 @@ class SoundpadMixer extends Readable {
         if (!Object.hasOwn(this.layers, kind)) throw new Error('Camada de áudio inválida.');
         this.started = true;
         this.layers[kind]?.stop();
-        this.layers[kind] = new PcmLayer(filePath, (error) => this.onError?.(kind, error), () => this.pump());
+        this.layers[kind] = null;
+        try {
+            this.layers[kind] = new PcmLayer(filePath, (error) => this.onError?.(kind, error), () => this.pump());
+        } catch (error) {
+            this.onError?.(kind, error);
+            this.finishIfEmpty();
+            throw error;
+        }
         this.pump();
     }
 

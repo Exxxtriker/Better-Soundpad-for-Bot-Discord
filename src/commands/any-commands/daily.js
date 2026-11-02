@@ -12,6 +12,7 @@ module.exports = {
         .setDMPermission(false),
 
     async execute(interaction) {
+        await interaction.deferReply();
         try {
             const userId = interaction.user.id;
             const { guildId } = interaction;
@@ -56,7 +57,7 @@ module.exports = {
                     .setDescription(`Você já coletou sua recompensa diária.\nTente novamente em **${hours}h ${minutes}m ${seconds}s**.`)
                     .setFooter({ text: 'Volte amanhã para coletar novamente!' });
 
-                return interaction.reply({ embeds: [embed], flags: 64 });
+                return interaction.editReply({ embeds: [embed] });
             }
 
             // Mensagem customizada dependendo do valor
@@ -70,11 +71,11 @@ module.exports = {
                 .setDescription(`${message}\nVocê ganhou **${reward} 🪙**.`)
                 .setFooter({ text: 'Volte amanhã para coletar novamente!' });
 
-            return interaction.reply({ embeds: [embed] });
+            return interaction.editReply({ embeds: [embed] });
         } catch (error) {
             console.error('Erro no comando /daily:', error);
             const response = { content: '❌ Ocorreu um erro ao tentar coletar o daily.' };
-            if (interaction.replied || interaction.deferred) return interaction.followUp({ ...response, flags: 64 });
+            if (interaction.replied || interaction.deferred) return interaction.editReply(response);
             return interaction.reply({ ...response, flags: 64 });
         }
     },

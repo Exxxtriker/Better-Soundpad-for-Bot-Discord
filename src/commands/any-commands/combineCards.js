@@ -148,6 +148,7 @@ module.exports = {
     },
 
     async execute(interaction) {
+        await interaction.deferReply();
         const firstIdentifier = interaction.options.getString('primeira', true);
         const secondIdentifier = interaction.options.getString('segunda', true);
         const result = await combineDuplicates(
@@ -158,27 +159,24 @@ module.exports = {
         );
 
         if (result.status === 'invalid') {
-            return interaction.reply({ content: '❌ Essa carta não existe no códice.', flags: 64 });
+            return interaction.editReply({ content: '❌ Essa carta não existe no códice.' });
         }
         if (result.status === 'maximum') {
-            return interaction.reply({ content: '❌ Cartas míticas já atingiram a raridade máxima.', flags: 64 });
+            return interaction.editReply({ content: '❌ Cartas míticas já atingiram a raridade máxima.' });
         }
         if (result.status === 'insufficient') {
-            return interaction.reply({
+            return interaction.editReply({
                 content: '❌ Você precisa possuir pelo menos **duas cópias** dessa carta.',
-                flags: 64,
             });
         }
         if (result.status === 'mismatch') {
-            return interaction.reply({
+            return interaction.editReply({
                 content: '❌ Escolha duas cópias da **mesma carta**.',
-                flags: 64,
             });
         }
         if (result.status === 'protected') {
-            return interaction.reply({
+            return interaction.editReply({
                 content: '💍 Uma das cópias escolhidas está protegida por vínculo.',
-                flags: 64,
             });
         }
 
@@ -221,7 +219,7 @@ module.exports = {
             files.push(new AttachmentBuilder(artwork.attachment, { name: artwork.name }));
         }
 
-        return interaction.reply({ embeds: [embed], files });
+        return interaction.editReply({ embeds: [embed], files });
     },
 
     combineDuplicates,

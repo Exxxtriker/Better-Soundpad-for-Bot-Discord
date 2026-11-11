@@ -1,0 +1,12 @@
+.env
+node_modules
+src/commands/commands-audios/audios/*
+!src/commands/commands-audios/audios/.gitkeep
+# Cookies de autenticação locais do yt-dlp (nunca enviar ao Git)
+cookies.txt
+src/commands/commands-audios/cookies*.txt
+*.cookies.txt
+logs/*.txt
+# Artefatos temporarios de diagnostico do yt-dlp
+.runtime-tmp/
+.tmp-ytdlp/

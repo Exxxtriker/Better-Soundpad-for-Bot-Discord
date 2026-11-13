@@ -300,24 +300,36 @@ async function dismissReply(interaction) {
 
 function getFirstMediaEntry(info) {
     if (!Array.isArray(info?.entries)) return info;
-    return info.entries.find((entry) => entry && typeof entry === 'object') ?? info;
+    const entry = info.entries.find((item) => item && typeof item === 'object');
+    if (entry) return getFirstMediaEntry(entry);
+    const error = new Error('A busca não encontrou nenhuma faixa.');
+    error.code = 'MEDIA_NO_RESULTS';
+    throw error;
 }
 
 function getSelectedStreamData(info) {
     const mediaInfo = getFirstMediaEntry(info);
-    const requestedAudio = mediaInfo.requested_downloads?.find((format) => format?.url);
-    const mergedAudio = mediaInfo.requested_formats?.find(
-        (format) => format?.url && format.acodec !== 'none',
+    const isAudio = (format) => Boolean(
+        /^https?:\/\//i.test(format?.url ?? '')
+        && format.acodec !== 'none'
+        && !['url', 'url_transparent', 'playlist'].includes(format._type), // eslint-disable-line no-underscore-dangle
     );
-    const availableAudio = mediaInfo.formats?.findLast?.(
-        (format) => format?.url && format.acodec !== 'none',
-    );
-    const selectedFormat = requestedAudio ?? mergedAudio ?? availableAudio ?? mediaInfo;
-    const streamUrl = selectedFormat.url ?? mediaInfo.url;
-    if (!streamUrl) throw new Error('A plataforma não retornou uma URL de áudio reproduzível.');
+    const requestedAudio = mediaInfo?.requested_downloads?.find(isAudio);
+    const mergedAudio = mediaInfo?.requested_formats?.find(isAudio);
+    // Respeita o formato selecionado pelo -f antes de procurar outro na lista.
+    const selectedAudio = isAudio(mediaInfo) ? mediaInfo : null;
+    const availableFormats = mediaInfo?.formats?.filter(isAudio) ?? [];
+    const availableAudio = availableFormats.findLast((format) => format.vcodec === 'none')
+        ?? availableFormats.at(-1);
+    const selectedFormat = requestedAudio ?? mergedAudio ?? selectedAudio ?? availableAudio;
+    if (!selectedFormat) {
+        const error = new Error('A plataforma não retornou uma URL de áudio reproduzível.');
+        error.code = 'MEDIA_NO_AUDIO';
+        throw error;
+    }
 
     return {
-        streamUrl,
+        streamUrl: selectedFormat.url,
         httpHeaders: selectedFormat.http_headers ?? mediaInfo.http_headers ?? {},
     };
 }
@@ -327,7 +339,7 @@ function normalizeMatchText(value) {
         .normalize('NFD')
         .replace(/[\u0300-\u036f]/g, '')
         .toLowerCase()
-        .replace(/[^a-z0-9]+/g, ' ')
+        .replace(/[^\p{L}\p{N}]+/gu, ' ')
         .trim();
 }
 
@@ -370,6 +382,47 @@ function scoreYouTubeCandidate(candidate, song) {
         if (candidateTitle.includes(term) && !title.includes(term)) score -= 9;
     });
     return score;
+}
+
+function getSpotifySearchQueries(song) {
+    const title = String(song.title ?? '').trim();
+    const artist = String(song.uploader ?? '').trim();
+    const clean = (text) => text.replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+    // Uma busca com artista pode vir vazia mesmo quando o vídeo existe.
+    return [...new Set([
+        `${title} ${artist}`.trim(),
+        clean(`${title} ${artist}`),
+        clean(title),
+    ].filter(Boolean))];
+}
+
+function isSpotifyCandidateMatch(candidate, song) {
+    if (candidate.is_live || candidate.live_status === 'is_live') return false;
+    const expectedTitle = normalizeMatchText(song.title);
+    const candidateTitle = normalizeMatchText(candidate.title);
+    const meaningfulTokens = getMatchTokens(song.title);
+    const titleTokens = meaningfulTokens.length ? meaningfulTokens : expectedTitle.split(' ').filter(Boolean);
+    if (!titleTokens.length) return false;
+    const matched = titleTokens.filter((token) => candidateTitle.split(' ').includes(token)).length;
+    if (matched / titleTokens.length < 0.6) return false;
+
+    const versions = ['cover', 'karaoke', 'slowed', 'sped up', 'speed up', 'nightcore', 'remix', 'live'];
+    if (versions.some((version) => new RegExp(`\\b${version}\\b`).test(candidateTitle)
+        && !new RegExp(`\\b${version}\\b`).test(expectedTitle))) return false;
+
+    const duration = Number(song.duration);
+    const candidateDuration = Number(candidate.duration);
+    const hasDuration = duration > 0 && candidateDuration > 0;
+    const difference = Math.abs(duration - candidateDuration);
+    if (hasDuration && difference > Math.max(15, duration * 0.1)) return false;
+    const artist = normalizeMatchText(song.uploader);
+    const candidateText = `${candidateTitle} ${normalizeMatchText(candidate.uploader ?? candidate.channel)}`;
+    const artistTokens = getMatchTokens(song.uploader);
+    const artistMatches = artist && (candidateText.includes(artist)
+        || (artistTokens.length > 0 && artistTokens.every((token) => candidateText.split(' ').includes(token))));
+    // Sem confirmação do artista, exige título e duração bem próximos.
+    return Boolean(artistMatches || (matched === titleTokens.length && hasDuration
+        && difference <= Math.max(5, duration * 0.03)));
 }
 
 function getYouTubeCandidateUrl(candidate) {
@@ -563,50 +616,49 @@ function searchYouTubeCandidates(query, options = {}) {
 async function resolveSpotifyPlayback(song, helpers = {}) {
     const search = helpers.search ?? searchYouTubeCandidates;
     const resolveCandidate = helpers.resolveCandidate ?? getSongInfo;
-    const query = `${song.title} ${song.uploader}`.trim();
-    const candidates = await search(query, { limit: SPOTIFY_SEARCH_LIMIT });
+    const queries = getSpotifySearchQueries(song);
     const failedSources = new Set(song.failedStreamSources ?? []);
-    const ranked = candidates
-        .map((candidate) => ({
-            candidate,
-            url: getYouTubeCandidateUrl(candidate),
-            score: scoreYouTubeCandidate(candidate, song),
-        }))
-        .filter((item) => item.url && !failedSources.has(getMediaSourceKey(item.url)))
-        .sort((left, right) => right.score - left.score);
-
+    const attemptedSources = new Set();
     let lastError = null;
-    const attempts = ranked.slice(0, SPOTIFY_CANDIDATE_ATTEMPTS);
-    const tryCandidate = async (index) => {
-        if (index >= attempts.length) return null;
+    for (const query of queries) {
+        let candidates;
         try {
-            const item = attempts[index];
-            return await resolveCandidate(item.url, { useCookies: false, timeoutMs: 20_000 });
+            candidates = await search(query, { limit: SPOTIFY_SEARCH_LIMIT }); // eslint-disable-line no-await-in-loop
         } catch (error) {
+            if (isProcessResourceError(error)) throw error;
             lastError = error;
-            return tryCandidate(index + 1);
+            continue; // eslint-disable-line no-continue
         }
-    };
-    const resolved = await tryCandidate(0);
-    if (resolved) return resolved;
-
-    try {
-        const finalCandidate = await resolveCandidate(`${query} official audio`, {
-            useCookies: false,
-            timeoutMs: 30_000,
-        });
-        if (failedSources.has(getMediaSourceKey(finalCandidate.url))) {
-            const repeatedSourceError = new Error(
-                'A busca retornou novamente uma fonte de áudio que já havia falhado.',
-            );
-            repeatedSourceError.code = 'SPOTIFY_REPEATED_SOURCE';
-            throw repeatedSourceError;
+        const ranked = candidates
+            .filter((candidate) => isSpotifyCandidateMatch(candidate, song))
+            .map((candidate) => ({
+                url: getYouTubeCandidateUrl(candidate),
+                score: scoreYouTubeCandidate(candidate, song),
+            }))
+            .filter((item) => item.url && !failedSources.has(getMediaSourceKey(item.url))
+                && !attemptedSources.has(getMediaSourceKey(item.url)))
+            .sort((left, right) => right.score - left.score);
+        for (const item of ranked) {
+            if (attemptedSources.size >= SPOTIFY_CANDIDATE_ATTEMPTS) break;
+            attemptedSources.add(getMediaSourceKey(item.url));
+            try {
+                const resolved = await resolveCandidate(item.url, { useCookies: false, timeoutMs: 20_000 }); // eslint-disable-line no-await-in-loop
+                if (!resolved?.streamUrl) throw Object.assign(new Error('A fonte não retornou áudio.'), { code: 'MEDIA_NO_AUDIO' });
+                return resolved;
+            } catch (error) {
+                if (isProcessResourceError(error)) throw error;
+                lastError = error;
+            }
         }
-        return finalCandidate;
-    } catch (error) {
-        lastError = error;
+        if (attemptedSources.size >= SPOTIFY_CANDIDATE_ATTEMPTS) break;
     }
-    throw lastError ?? new Error('Nenhum resultado reproduzível foi encontrado para esta faixa do Spotify.');
+    const error = new Error('Nenhuma fonte de áudio compatível foi encontrada para esta faixa do Spotify.', {
+        cause: lastError ?? undefined,
+    });
+    error.code = 'SPOTIFY_NO_PLAYABLE_SOURCE';
+    const reason = lastError ? `Última falha: ${lastError.message}` : 'Nenhum resultado correspondeu ao título, artista e duração.';
+    error.details = `${queries.length} variações de busca; ${attemptedSources.size} fontes testadas. ${reason}`;
+    throw error;
 }
 
 function createPlaylistQueueSongs(info, user, sourceQuery) {
@@ -1754,6 +1806,8 @@ module.exports = {
     getSelectedStreamData,
     normalizeMatchText,
     scoreYouTubeCandidate,
+    getSpotifySearchQueries,
+    isSpotifyCandidateMatch,
     getYouTubeCandidateUrl,
     getMediaSourceKey,
     isRecoverableStreamError,

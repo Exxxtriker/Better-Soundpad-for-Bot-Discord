@@ -15,6 +15,7 @@ const activePlayers = require('../../handlers/activePlayers');
 const { writeErrorLog } = require('../../utils/errorLogger');
 const { safelyDestroyVoiceConnection } = require('../../utils/voiceConnection');
 const { createVoiceSessionGuard } = require('../../utils/voiceSessionGuard');
+const { createAudioMetadataCache } = require('../../utils/audioMetadataCache');
 const {
     YOUTUBE_HOSTS, getYouTubeStartTime, validateSongStartTime, parseYouTubeRequest,
 } = require('../../utils/youtubeTimestamp');
@@ -25,6 +26,7 @@ const {
 const YT_DLP_PATH = path.join(__dirname, '../commands-audios/yt-dlp.exe');
 const STREAM_URL_MAX_AGE = 4 * 60 * 60 * 1000;
 const DIRECT_STREAM_START_TIMEOUT = 8_000;
+const DIRECT_STREAM_ATTEMPT_TIMEOUT = 3_000;
 const FALLBACK_STREAM_START_TIMEOUT = 20_000;
 const STREAM_BUFFER_SIZE = 512 * 1024;
 const PCM_BYTES_PER_SECOND = 48_000 * 2 * 2;
@@ -37,6 +39,7 @@ const MAX_MUSIC_HISTORY_SIZE = 100;
 const MAX_YOUTUBE_MIX_SIZE = 50;
 const MAX_VOICE_STATUS_LENGTH = 500;
 const MAX_YT_DLP_METADATA_PROCESSES = 2;
+const audioMetadataCache = createAudioMetadataCache();
 
 function rememberSong(queue, song) {
     if (!song) return;
@@ -59,7 +62,7 @@ function execYtDlpMetadata(file, args, options, callback) {
             callback(...result);
         };
         try {
-            execFile(file, args, options, finish);
+            execFile(file, args, { windowsHide: true, ...options }, finish);
         } catch (error) {
             finish(error, '', '');
         }
@@ -307,10 +310,23 @@ function getSelectedStreamData(info) {
         error.code = 'MEDIA_NO_AUDIO';
         throw error;
     }
+    const audioOnlyFormats = availableFormats.filter((format) => format.vcodec === 'none');
+    const alternativeFormats = audioOnlyFormats.length ? audioOnlyFormats : availableFormats;
 
     return {
         streamUrl: selectedFormat.url,
         httpHeaders: selectedFormat.http_headers ?? mediaInfo.http_headers ?? {},
+        streamAlternatives: [
+            ...alternativeFormats.filter((format) => /m3u8/.test(format.protocol ?? '')).reverse(),
+            ...alternativeFormats.filter((format) => !/m3u8/.test(format.protocol ?? '')).reverse(),
+        ]
+            .filter((format, index, formats) => format.url !== selectedFormat.url
+                && formats.findIndex((other) => other.url === format.url) === index)
+            .slice(0, 2)
+            .map((format) => ({
+                streamUrl: format.url,
+                httpHeaders: format.http_headers ?? mediaInfo.http_headers ?? {},
+            })),
     };
 }
 
@@ -520,9 +536,8 @@ function parseYtDlpJson(stdout, fallbackMessage) {
 }
 
 // ─── Pega info da música via yt-dlp ──────────────────────────────
-function getSongInfo(query, options = {}) {
+function extractSongInfo(query, options = {}) {
     return new Promise((resolve, reject) => {
-        const startTime = getYouTubeStartTime(query);
         const { timeoutMs = 60_000 } = options;
         const input = /^https:\/\//i.test(query) ? query : `ytsearch1:${query}`;
         execYtDlpMetadata(YT_DLP_PATH, [
@@ -544,7 +559,6 @@ function getSongInfo(query, options = {}) {
                 return reject(parseError);
             }
             try {
-                validateSongStartTime({ duration: info.duration, startTime });
                 const streamData = getSelectedStreamData(info);
                 return resolve({
                     title: info.title ?? 'Desconhecido',
@@ -555,7 +569,7 @@ function getSongInfo(query, options = {}) {
                     platform: getSongPlatform(info),
                     formattedDuration: formatDuration(info.duration ?? 0),
                     ...streamData,
-                    startTime,
+                    isLive: info.is_live === true,
                     resolvedAt: Date.now(),
                     user: null, // preenchido depois
                 });
@@ -564,6 +578,34 @@ function getSongInfo(query, options = {}) {
             }
         });
     });
+}
+
+function isSongStreamFresh(song, now = Date.now()) {
+    let expiresAt = Infinity;
+    try {
+        const expiry = Number(new URL(song?.streamUrl).searchParams.get('expire'));
+        if (expiry > 0) expiresAt = expiry * 1000 - 60_000;
+    } catch {
+        // Provedores sem validade explícita usam a janela normal de atualização.
+    }
+    return Boolean(
+        song?.streamUrl
+        && Number.isFinite(song.resolvedAt)
+        && now - song.resolvedAt < STREAM_URL_MAX_AGE
+        && now < expiresAt,
+    );
+}
+
+async function getSongInfo(query, options = {}) {
+    const key = getMediaSourceKey(query);
+    const startTime = getYouTubeStartTime(query);
+    let info = await audioMetadataCache.load(key, () => extractSongInfo(query, options));
+    if (!isSongStreamFresh(info)) {
+        audioMetadataCache.invalidate(key);
+        info = await audioMetadataCache.load(key, () => extractSongInfo(query, options));
+    }
+    validateSongStartTime({ ...info, startTime });
+    return { ...info, startTime };
 }
 
 function searchYouTubeCandidates(query, options = {}) {
@@ -793,14 +835,6 @@ async function getSoundCloudSongs(query, user, helpers = {}) {
     });
 }
 
-function isSongStreamFresh(song, now = Date.now()) {
-    return Boolean(
-        song?.streamUrl
-        && Number.isFinite(song.resolvedAt)
-        && now - song.resolvedAt < STREAM_URL_MAX_AGE,
-    );
-}
-
 async function resolveSongStream(song, resolver = getSongInfo) {
     if (isSongStreamFresh(song)) return song;
     if (song.streamResolution) return song.streamResolution;
@@ -813,6 +847,7 @@ async function resolveSongStream(song, resolver = getSongInfo) {
         if (song.preserveMetadata) {
             song.streamUrl = streamInfo.streamUrl;
             song.httpHeaders = streamInfo.httpHeaders;
+            song.streamAlternatives = streamInfo.streamAlternatives;
             song.resolvedAt = streamInfo.resolvedAt;
             song.streamQuery = streamInfo.url;
         } else {
@@ -839,6 +874,7 @@ function resolveSongForPlayback(song) {
 }
 
 function prefetchNextSong(queue, resolver = null) {
+    if (queue?.player?.state?.status === AudioPlayerStatus.Buffering) return null;
     const nextSong = queue?.songs?.[1];
     if (!nextSong || isSongStreamFresh(nextSong)) return null;
     const resolution = resolver
@@ -851,8 +887,6 @@ function prefetchNextSong(queue, resolver = null) {
 function createYtStream(song, spawnProcess = spawn) {
     const startTime = validateSongStartTime(song);
     const seekArgs = startTime > 0 ? ['-ss', String(startTime)] : [];
-    const headers = buildFfmpegHeaders(song.httpHeaders);
-    const inputOptions = headers ? ['-headers', headers] : [];
     const output = new PassThrough({ highWaterMark: STREAM_BUFFER_SIZE });
     const processes = {
         ytdlp: null,
@@ -896,9 +930,6 @@ function createYtStream(song, spawnProcess = spawn) {
         }
         return playbackError;
     };
-    let directBytes = 0;
-    let directError = '';
-    let directFinished = false;
     let fallbackStarted = false;
     let directStartTimer = null;
 
@@ -936,7 +967,7 @@ function createYtStream(song, spawnProcess = spawn) {
                 '--quiet',
                 '-o', '-',
                 fallbackInput,
-            ]);
+            ], { windowsHide: true });
             processes.ytdlp = ytdlp;
             ytdlp.on('error', fail);
             fallbackFfmpeg = spawnProcess(ffmpegPath, [
@@ -952,7 +983,7 @@ function createYtStream(song, spawnProcess = spawn) {
                 '-ar', '48000',
                 '-ac', '2',
                 'pipe:1',
-            ]);
+            ], { windowsHide: true });
             processes.ffmpeg = fallbackFfmpeg;
         } catch (error) {
             registerPlaybackFailure(error);
@@ -1036,69 +1067,88 @@ function createYtStream(song, spawnProcess = spawn) {
         return { stream: output, processes };
     }
 
-    const ffmpeg = spawnProcess(ffmpegPath, [
-        '-nostdin',
-        '-loglevel', 'error',
-        '-reconnect', '1',
-        '-reconnect_streamed', '1',
-        '-reconnect_on_network_error', '1',
-        '-reconnect_on_http_error', '429,5xx',
-        '-reconnect_delay_max', '2',
-        '-rw_timeout', '15000000',
-        ...inputOptions,
-        ...seekArgs,
-        '-re',
-        '-i', song.streamUrl,
-        '-vn',
-        '-f', 's16le',
-        '-ar', '48000',
-        '-ac', '2',
-        'pipe:1',
-    ]);
-    processes.ffmpeg = ffmpeg;
-    directStartTimer = processes.setTimer(() => {
-        if (processes.cancelled || directFinished || directBytes > 0) return;
-        ffmpeg.kill();
-    }, DIRECT_STREAM_START_TIMEOUT);
-
-    ffmpeg.stdout.on('error', (error) => {
-        if (!processes.cancelled) console.error('[FFmpeg] Erro no fluxo de saída:', error);
-    });
-    ffmpeg.stdout.on('data', (chunk) => {
-        directBytes += chunk.length;
-        processes.clearTimer(directStartTimer);
-    });
-    ffmpeg.stdout.pipe(output, { end: false });
-    ffmpeg.stderr.on('data', (data) => {
-        directError = `${directError}${data}`.slice(-4_000);
-    });
-    ffmpeg.on('error', (error) => {
-        if (isProcessResourceError(error)) {
+    const directSources = [{ streamUrl: song.streamUrl, httpHeaders: song.httpHeaders }, ...(song.streamAlternatives ?? [])]
+        .filter((source, index, sources) => source?.streamUrl
+            && sources.findIndex((other) => other.streamUrl === source.streamUrl) === index)
+        .slice(0, 3);
+    const directDeadline = Date.now() + DIRECT_STREAM_START_TIMEOUT;
+    const startDirect = (index) => {
+        const source = directSources[index];
+        if (!source || processes.cancelled) return;
+        const headers = buildFfmpegHeaders(source.httpHeaders);
+        const inputOptions = headers ? ['-headers', headers] : [];
+        const attempt = { bytes: 0, error: '', finished: false };
+        let ffmpeg;
+        try {
+            ffmpeg = spawnProcess(ffmpegPath, [
+                '-nostdin', '-loglevel', 'error',
+                '-reconnect', '1', '-reconnect_streamed', '1',
+                '-reconnect_on_network_error', '1', '-reconnect_on_http_error', '429,5xx',
+                '-reconnect_delay_max', '2', '-rw_timeout', '15000000',
+                ...inputOptions, ...seekArgs, '-re', '-i', source.streamUrl,
+                '-vn', '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1',
+            ], { windowsHide: true });
+        } catch (error) {
+            if (index === 0) throw error;
             registerPlaybackFailure(error);
             processes.cancel();
             output.end();
-        } else {
-            console.error('Falha ao iniciar FFmpeg:', error);
+            return;
         }
-    });
-    ffmpeg.on('close', (code) => {
-        if (directFinished) return;
-        directFinished = true;
-        if (!processes.cancelled && code !== 0 && directBytes === 0) {
-            startFallback();
-        } else if (!output.destroyed && !output.writableEnded) {
-            if (!processes.cancelled && code !== 0) {
-                processes.failed = true;
-                const streamError = new Error('A transmissão direta de áudio foi interrompida.');
-                streamError.code = `FFMPEG_EXIT_${code}`;
-                streamError.platform = getSongPlatform(song);
-                streamError.track = String(song?.title ?? song?.name ?? 'Faixa desconhecida');
-                if (directError.trim()) streamError.details = directError.trim();
-                registerPlaybackFailure(streamError);
+        processes.ffmpeg = ffmpeg;
+        const hasAlternative = index + 1 < directSources.length;
+        const remaining = Math.max(1, directDeadline - Date.now());
+        const budget = hasAlternative ? Math.min(DIRECT_STREAM_ATTEMPT_TIMEOUT, remaining) : remaining;
+        directStartTimer = processes.setTimer(() => {
+            if (!processes.cancelled && !attempt.finished && attempt.bytes === 0) ffmpeg.kill();
+        }, budget);
+
+        ffmpeg.stdout.on('error', (error) => {
+            if (!processes.cancelled) attempt.error = error.message;
+        });
+        ffmpeg.stdout.on('data', (chunk) => {
+            if (processes.cancelled) return;
+            if (attempt.bytes === 0) {
+                processes.clearTimer(directStartTimer);
+                song.streamUrl = source.streamUrl;
+                song.httpHeaders = source.httpHeaders;
             }
-            output.end();
-        }
-    });
+            attempt.bytes += chunk.length;
+        });
+        ffmpeg.stdout.pipe(output, { end: false });
+        ffmpeg.stderr.on('data', (data) => {
+            attempt.error = `${attempt.error}${data}`.slice(-4_000);
+        });
+        ffmpeg.on('error', (error) => {
+            if (isProcessResourceError(error)) {
+                registerPlaybackFailure(error);
+                processes.cancel();
+                output.end();
+            } else attempt.error = error.message;
+        });
+        ffmpeg.on('close', (code) => {
+            if (attempt.finished) return;
+            attempt.finished = true;
+            processes.clearTimer(directStartTimer);
+            if (processes.cancelled) return;
+            if (attempt.bytes === 0) {
+                if (hasAlternative && Date.now() < directDeadline) startDirect(index + 1);
+                else startFallback();
+                return;
+            }
+            if (!output.destroyed && !output.writableEnded) {
+                if (code !== 0) {
+                    const streamError = new Error('A transmissão direta de áudio foi interrompida.');
+                    streamError.code = `FFMPEG_EXIT_${code}`;
+                    if (attempt.error.trim()) streamError.details = attempt.error.trim();
+                    registerPlaybackFailure(streamError);
+                }
+                output.end();
+            }
+        });
+    };
+    if (directSources.length) startDirect(0);
+    else startFallback();
 
     return { stream: output, processes };
 }
@@ -1258,8 +1308,10 @@ async function playNext(guildId) {
     queue.currentResource = resource;
 
     prefetchNextSong(queue);
-    await setVoiceChannelStatus(queue.voiceChannel, createVoiceChannelStatus(song));
-    await updateMessage(guildId);
+    await Promise.all([
+        setVoiceChannelStatus(queue.voiceChannel, createVoiceChannelStatus(song)),
+        updateMessage(guildId),
+    ]);
 }
 
 async function playNextAvailable(guildId, starter = playNext) {
@@ -1527,6 +1579,9 @@ async function createQueue(guild, voiceChannel) {
     };
 
     guildQueues.set(guild.id, queue);
+    player.on(AudioPlayerStatus.Playing, () => {
+        if (guildQueues.get(guild.id) === queue) prefetchNextSong(queue);
+    });
     player.on('error', (error) => {
         const activeQueue = guildQueues.get(guild.id);
         if (activeQueue?.currentProcesses) activeQueue.currentProcesses.failed = true;

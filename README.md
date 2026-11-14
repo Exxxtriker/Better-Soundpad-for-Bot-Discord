@@ -44,6 +44,8 @@ Gideon é um bot multitarefa para Discord criado para acompanhar campanhas de RP
 
 A fila do `/play` aceita até 1.000 faixas no total. O histórico do botão anterior conserva as últimas 100 faixas.
 
+O player prepara a próxima faixa durante a reprodução e mantém um cache curto em memória para evitar buscas repetidas. Quando uma URL de áudio falha antes de começar, tenta fontes alternativas já resolvidas antes de executar outra extração. A reprodução permanece sem login no YouTube.
+
 O `/play` identifica automaticamente vídeos, playlists e Mixes do YouTube:
 
 - Vídeo com tempo marcado: toca somente o vídeo a partir desse ponto, mesmo se o link também contiver `list`. Exemplo: `/play https://youtu.be/VIDEO_ID?t=90` inicia em **1min30s**. Aceita também `t=1m30s`, `start=90`, `#t=90` e `t=0`.

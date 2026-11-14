@@ -75,6 +75,8 @@ const HELP_PAGES = [
         title: '🎶 Música e áudios',
         description: [
             '`/play` — Toca músicas e playlists de YouTube, Spotify e SoundCloud.',
+            'Vídeo com `t=90` ou `t=1m30s`: toca só o vídeo em **1min30s**, mesmo com `list` no link.',
+            'Sem tempo marcado, links com `list` carregam a playlist ou até **50 faixas** de um Mix.',
             '`/soundpad` — Reproduz trilhas e efeitos simultâneos, com volume próprio para cada camada.',
             '',
             'Os players possuem fila, pausa, pular, voltar e loop.',

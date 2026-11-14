@@ -6,6 +6,7 @@ src/commands/commands-audios/audios/*
 cookies.txt
 src/commands/commands-audios/cookies*.txt
 *.cookies.txt
+*cookies*.txt
 logs/*.txt
 # Artefatos temporarios de diagnostico do yt-dlp
 .runtime-tmp/

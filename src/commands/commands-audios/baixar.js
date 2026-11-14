@@ -104,9 +104,9 @@ module.exports = {
             downloadReserved = true;
 
             const ytDlpPath = path.join(__dirname, 'yt-dlp.exe');
-            const cookiesPath = path.join(__dirname, 'cookies.txt');
             if (!fs.existsSync(ytDlpPath)) throw new Error('O executável yt-dlp.exe não foi encontrado.');
             const args = [
+                '--ignore-config',
                 '--extractor-args',
                 'youtube:player_client=android',
                 '--user-agent',
@@ -126,8 +126,6 @@ module.exports = {
                 outputTemplate,
                 url,
             ];
-
-            if (fs.existsSync(cookiesPath)) args.unshift('--cookies', cookiesPath);
 
             const { stdout, stderr } = await execFileAsync(ytDlpPath, args, {
                 timeout: 10 * 60 * 1000,

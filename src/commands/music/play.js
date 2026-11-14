@@ -16,11 +16,13 @@ const { writeErrorLog } = require('../../utils/errorLogger');
 const { safelyDestroyVoiceConnection } = require('../../utils/voiceConnection');
 const { createVoiceSessionGuard } = require('../../utils/voiceSessionGuard');
 const {
+    YOUTUBE_HOSTS, getYouTubeStartTime, validateSongStartTime, parseYouTubeRequest,
+} = require('../../utils/youtubeTimestamp');
+const {
     isSpotifyMetadataParseError, parseSpotifyReference, parseSpotifyEmbed, readSpotifyPublicMetadata,
 } = require('../../utils/spotifyMetadata');
 
 const YT_DLP_PATH = path.join(__dirname, '../commands-audios/yt-dlp.exe');
-const COOKIES_PATH = path.join(__dirname, '../commands-audios/cookies.txt');
 const STREAM_URL_MAX_AGE = 4 * 60 * 60 * 1000;
 const DIRECT_STREAM_START_TIMEOUT = 8_000;
 const FALLBACK_STREAM_START_TIMEOUT = 20_000;
@@ -32,6 +34,7 @@ const SPOTIFY_SOURCE_RECOVERY_ATTEMPTS = 2;
 const DEFAULT_MUSIC_VOLUME = 100;
 const MAX_MUSIC_QUEUE_SIZE = 1_000;
 const MAX_MUSIC_HISTORY_SIZE = 100;
+const MAX_YOUTUBE_MIX_SIZE = 50;
 const MAX_VOICE_STATUS_LENGTH = 500;
 const MAX_YT_DLP_METADATA_PROCESSES = 2;
 
@@ -172,11 +175,10 @@ function getPlatformIcon(song) {
 
 function isPlaylistUrl(query) {
     if (!/^https:\/\//i.test(query)) return false;
+    const youtube = parseYouTubeRequest(query);
+    if (youtube) return ['playlist', 'mix'].includes(youtube.type);
     const parsed = new URL(query);
     const hostname = parsed.hostname.toLowerCase();
-    if (hostname === 'youtu.be' || hostname.endsWith('youtube.com')) {
-        return parsed.pathname === '/playlist' || Boolean(parsed.searchParams.get('list'));
-    }
     if (hostname.includes('soundcloud.com')) return parsed.pathname.split('/').includes('sets');
     return false;
 }
@@ -188,11 +190,13 @@ function getLoopMode(customMode, repeatMode = 0) {
 
 function validateQuery(query) {
     const trimmed = query.trim();
-    if (!trimmed || trimmed.length > 200) {
+    const isUrl = /^https?:\/\//i.test(trimmed);
+    if (!trimmed || (!isUrl && trimmed.length > 200)) {
         throw new Error('Use uma busca entre 1 e 200 caracteres.');
     }
 
-    if (!/^https?:\/\//i.test(trimmed)) return trimmed;
+    if (!isUrl) return trimmed;
+    if (trimmed.length > 2048) throw new Error('Use um link de até 2048 caracteres.');
 
     let parsed;
     try {
@@ -202,40 +206,14 @@ function validateQuery(query) {
     }
 
     const allowedHosts = [
-        'youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be',
+        ...YOUTUBE_HOSTS,
         'spotify.com', 'open.spotify.com', 'soundcloud.com', 'www.soundcloud.com', 'on.soundcloud.com',
     ];
     if (parsed.protocol !== 'https:' || !allowedHosts.includes(parsed.hostname.toLowerCase())) {
         throw new Error('Apenas links HTTPS do YouTube, Spotify e SoundCloud são aceitos.');
     }
 
-    const hostname = parsed.hostname.toLowerCase();
-    if (hostname === 'youtu.be' || hostname.endsWith('youtube.com')) {
-        const playlistId = parsed.searchParams.get('list');
-        if (playlistId !== null) {
-            if (!/^[A-Za-z0-9_-]{2,128}$/.test(playlistId)) {
-                throw new Error('O identificador da playlist do YouTube é inválido.');
-            }
-            const videoId = hostname === 'youtu.be'
-                ? parsed.pathname.split('/').filter(Boolean)[0]
-                : parsed.searchParams.get('v');
-            if (videoId) {
-                return `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&list=${encodeURIComponent(playlistId)}`;
-            }
-            return `https://www.youtube.com/playlist?list=${encodeURIComponent(playlistId)}`;
-        }
-    }
-    if (hostname === 'youtu.be') {
-        const videoId = parsed.pathname.split('/').filter(Boolean)[0];
-        if (videoId) return `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`;
-    }
-
-    if (hostname.endsWith('youtube.com')) {
-        const videoId = parsed.searchParams.get('v');
-        if (videoId) return `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`;
-    }
-
-    return parsed.toString();
+    return parseYouTubeRequest(parsed.toString())?.url ?? parsed.toString();
 }
 
 function stopProcesses(queue) {
@@ -251,12 +229,14 @@ function getQueryLogContext(query) {
         const url = new URL(query);
         const video = url.searchParams.get('v');
         const playlist = url.searchParams.get('list');
+        const startTime = url.searchParams.get('t');
         url.username = '';
         url.password = '';
         url.search = '';
         url.hash = '';
         if (video) url.searchParams.set('v', video);
         if (playlist) url.searchParams.set('list', playlist);
+        if (startTime) url.searchParams.set('t', startTime);
         return url.toString();
     } catch {
         return query.slice(0, 200);
@@ -464,10 +444,10 @@ function buildFfmpegHeaders(headers = {}) {
 }
 
 function isDecodedAudioComplete(song, decodedBytes) {
-    const expectedDuration = Number(song?.duration);
+    const expectedDuration = Number(song?.duration) - Number(song?.startTime ?? 0);
     if (!Number.isFinite(expectedDuration) || expectedDuration <= 0) return false;
     const decodedDuration = decodedBytes / PCM_BYTES_PER_SECOND;
-    const allowedDifference = Math.max(5, expectedDuration * 0.03);
+    const allowedDifference = Math.min(expectedDuration / 2, Math.max(5, expectedDuration * 0.03));
     return decodedDuration >= expectedDuration - allowedDifference;
 }
 
@@ -542,12 +522,11 @@ function parseYtDlpJson(stdout, fallbackMessage) {
 // ─── Pega info da música via yt-dlp ──────────────────────────────
 function getSongInfo(query, options = {}) {
     return new Promise((resolve, reject) => {
-        const { useCookies = true, timeoutMs = 60_000 } = options;
+        const startTime = getYouTubeStartTime(query);
+        const { timeoutMs = 60_000 } = options;
         const input = /^https:\/\//i.test(query) ? query : `ytsearch1:${query}`;
-        const cookieArgs = useCookies ? ['--cookies', COOKIES_PATH] : [];
         execYtDlpMetadata(YT_DLP_PATH, [
             '--ignore-config',
-            ...cookieArgs,
             '--js-runtimes', `node:${process.execPath}`,
             '-f', 'bestaudio/best',
             '--dump-single-json',
@@ -565,6 +544,7 @@ function getSongInfo(query, options = {}) {
                 return reject(parseError);
             }
             try {
+                validateSongStartTime({ duration: info.duration, startTime });
                 const streamData = getSelectedStreamData(info);
                 return resolve({
                     title: info.title ?? 'Desconhecido',
@@ -575,6 +555,7 @@ function getSongInfo(query, options = {}) {
                     platform: getSongPlatform(info),
                     formattedDuration: formatDuration(info.duration ?? 0),
                     ...streamData,
+                    startTime,
                     resolvedAt: Date.now(),
                     user: null, // preenchido depois
                 });
@@ -642,7 +623,7 @@ async function resolveSpotifyPlayback(song, helpers = {}) {
             if (attemptedSources.size >= SPOTIFY_CANDIDATE_ATTEMPTS) break;
             attemptedSources.add(getMediaSourceKey(item.url));
             try {
-                const resolved = await resolveCandidate(item.url, { useCookies: false, timeoutMs: 20_000 }); // eslint-disable-line no-await-in-loop
+                const resolved = await resolveCandidate(item.url, { timeoutMs: 20_000 }); // eslint-disable-line no-await-in-loop
                 if (!resolved?.streamUrl) throw Object.assign(new Error('A fonte não retornou áudio.'), { code: 'MEDIA_NO_AUDIO' });
                 return resolved;
             } catch (error) {
@@ -669,6 +650,7 @@ function createPlaylistQueueSongs(info, user, sourceQuery) {
 
     const platform = getSongPlatform({ ...info, url: sourceQuery });
     const songs = entries.map((entry) => {
+        if (!entry || typeof entry !== 'object') return null;
         let url = entry.webpage_url ?? entry.original_url ?? entry.url;
         if (platform === 'YouTube' && !/^https:\/\//i.test(url ?? '') && entry.id) {
             url = `https://www.youtube.com/watch?v=${encodeURIComponent(entry.id)}`;
@@ -696,22 +678,26 @@ function createPlaylistQueueSongs(info, user, sourceQuery) {
     return songs;
 }
 
-function getPlaylistSongs(query, user) {
+function getPlaylistSongs(query, user, helpers = {}) {
     return new Promise((resolve, reject) => {
-        const cookieArgs = detectMusicPlatform(query) === 'YouTube'
-            ? ['--cookies', COOKIES_PATH]
-            : [];
-        execYtDlpMetadata(YT_DLP_PATH, [
+        const youtube = parseYouTubeRequest(query);
+        if (youtube?.type === 'video') {
+            reject(new Error('Este link seleciona um vídeo, não uma playlist.'));
+            return;
+        }
+        const sourceQuery = youtube?.url ?? query;
+        const limit = youtube?.type === 'mix' ? MAX_YOUTUBE_MIX_SIZE : MAX_MUSIC_QUEUE_SIZE + 1;
+        const execute = helpers.execute ?? execYtDlpMetadata;
+        execute(YT_DLP_PATH, [
             '--ignore-config',
-            ...cookieArgs,
             '--js-runtimes', `node:${process.execPath}`,
             '--yes-playlist',
             '--flat-playlist',
             '--dump-single-json',
-            '--playlist-end', String(MAX_MUSIC_QUEUE_SIZE + 1),
+            '--playlist-end', String(limit),
             '--no-warnings',
             '--quiet',
-            query,
+            sourceQuery,
         ], { timeout: 60_000, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
             if (error) return reject(createYtDlpError(error, stderr));
             let info;
@@ -721,7 +707,7 @@ function getPlaylistSongs(query, user) {
                 return reject(parseError);
             }
             try {
-                return resolve(createPlaylistQueueSongs(info, user, query));
+                return resolve(createPlaylistQueueSongs(info, user, sourceQuery));
             } catch (playlistError) {
                 return reject(playlistError);
             }
@@ -822,6 +808,8 @@ async function resolveSongStream(song, resolver = getSongInfo) {
     const resolution = (async () => {
         const requester = song.user;
         const streamInfo = await resolver(song.streamQuery ?? song.url);
+        const startTime = song.startTime ?? streamInfo.startTime ?? 0;
+        validateSongStartTime({ ...streamInfo, startTime });
         if (song.preserveMetadata) {
             song.streamUrl = streamInfo.streamUrl;
             song.httpHeaders = streamInfo.httpHeaders;
@@ -831,6 +819,7 @@ async function resolveSongStream(song, resolver = getSongInfo) {
             Object.assign(song, streamInfo);
         }
         song.user = requester;
+        song.startTime = startTime;
         return song;
     })();
 
@@ -846,7 +835,6 @@ function resolveSongForPlayback(song) {
     const platform = getSongPlatform(song);
     let resolver = getSongInfo;
     if (platform === 'Spotify') resolver = () => resolveSpotifyPlayback(song);
-    else if (platform !== 'YouTube') resolver = (query) => getSongInfo(query, { useCookies: false });
     return resolveSongStream(song, resolver);
 }
 
@@ -861,6 +849,8 @@ function prefetchNextSong(queue, resolver = null) {
 
 // ─── Stream direto da URL resolvida pelo yt-dlp ──────────────────
 function createYtStream(song, spawnProcess = spawn) {
+    const startTime = validateSongStartTime(song);
+    const seekArgs = startTime > 0 ? ['-ss', String(startTime)] : [];
     const headers = buildFfmpegHeaders(song.httpHeaders);
     const inputOptions = headers ? ['-headers', headers] : [];
     const output = new PassThrough({ highWaterMark: STREAM_BUFFER_SIZE });
@@ -920,9 +910,6 @@ function createYtStream(song, spawnProcess = spawn) {
         const fallbackInput = /^https:\/\//i.test(streamQuery)
             ? streamQuery
             : `ytsearch1:${streamQuery}`;
-        const cookieArgs = detectMusicPlatform(fallbackInput) === 'YouTube'
-            ? ['--cookies', COOKIES_PATH]
-            : [];
 
         const fail = (error) => {
             if (processes.cancelled || processes.failed) return;
@@ -935,7 +922,6 @@ function createYtStream(song, spawnProcess = spawn) {
         try {
             ytdlp = spawnProcess(YT_DLP_PATH, [
                 '--ignore-config',
-                ...cookieArgs,
                 '--js-runtimes', `node:${process.execPath}`,
                 '-f', 'bestaudio/best',
                 '--no-playlist',
@@ -956,8 +942,11 @@ function createYtStream(song, spawnProcess = spawn) {
             fallbackFfmpeg = spawnProcess(ffmpegPath, [
                 '-nostdin',
                 '-loglevel', 'error',
-                '-re',
+                // O pipe não permite seek de entrada. Descarta a introdução sem
+                // limitar a leitura em tempo real; a saída respeita backpressure.
+                ...(startTime > 0 ? [] : ['-re']),
                 '-i', 'pipe:0',
+                ...seekArgs,
                 '-vn',
                 '-f', 's16le',
                 '-ar', '48000',
@@ -1057,6 +1046,7 @@ function createYtStream(song, spawnProcess = spawn) {
         '-reconnect_delay_max', '2',
         '-rw_timeout', '15000000',
         ...inputOptions,
+        ...seekArgs,
         '-re',
         '-i', song.streamUrl,
         '-vn',
@@ -1149,7 +1139,8 @@ function createEmbed(guildId) {
                 isPaused ? '⏸️ **A BALADA ESTÁ EM DESCANSO**' : '▶️ **BALADA EM EXECUÇÃO**',
                 uploader ? `🪕 Entoada por **${uploader.slice(0, 100)}**` : '🪕 Menestrel desconhecido',
                 `${getPlatformIcon(song)} Fonte: **${getSongPlatform(song)}**`,
-            ].join('\n'))
+                song.startTime > 0 ? `⏱️ Início em **${formatDuration(song.startTime)}**` : null,
+            ].filter(Boolean).join('\n'))
             .addFields(
                 { name: '⌛ Duração', value: `\`${song.formattedDuration ?? '?:??'}\``, inline: true },
                 { name: '🔊 Intensidade', value: `\`${volume}%\``, inline: true },
@@ -1735,7 +1726,7 @@ module.exports = {
             } else if (isPlaylistUrl(query)) {
                 songs = await getPlaylistSongs(query, interaction.user);
             } else {
-                const songInfo = await getSongInfo(query, { useCookies: true });
+                const songInfo = await getSongInfo(query);
                 songInfo.user = interaction.user;
                 songs = [songInfo];
             }
@@ -1763,12 +1754,12 @@ module.exports = {
 
             let response = '❌ Não foi possível carregar essa música. Confira a busca ou o link.';
             if (ageRestricted) {
-                response = '❌ Este vídeo possui restrição de idade. Atualize os cookies com uma conta apta a assisti-lo.';
+                response = '❌ Este vídeo exige confirmação de idade. O bot reproduz o YouTube sem login; escolha uma versão pública.';
             } else if (unavailable) {
                 response = '❌ Esse vídeo do YouTube está indisponível ou foi removido.';
             } else if (error?.code === 'MUSIC_QUEUE_FULL') {
                 response = `❌ ${error.message}`;
-            } else if (['SPOTIFY_METADATA_UNAVAILABLE', 'SPOTIFY_INVALID_URL'].includes(error?.code)) {
+            } else if (['SPOTIFY_METADATA_UNAVAILABLE', 'SPOTIFY_INVALID_URL', 'MUSIC_INVALID_START_TIME'].includes(error?.code)) {
                 response = `❌ ${error.message}`;
             } else if (isProcessResourceError(error)) {
                 const hasQueue = guildQueues.get(guildId)?.songs?.length > 0;

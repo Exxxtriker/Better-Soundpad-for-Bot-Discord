@@ -6,7 +6,6 @@
   "scripts": {
     "start": "cls && node app.js",
     "dev": "nodemon app.js --ignore config.json",
-    "cookies:youtube": "node scripts/refreshYoutubeCookies.js",
     "deploy:commands": "node slashBuilder.js",
     "lint": "eslint app.js config.js slashBuilder.js src scripts",
     "validate": "node scripts/validateCommands.js"

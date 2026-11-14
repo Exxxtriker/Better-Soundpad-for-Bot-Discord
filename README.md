@@ -44,6 +44,14 @@ Gideon é um bot multitarefa para Discord criado para acompanhar campanhas de RP
 
 A fila do `/play` aceita até 1.000 faixas no total. O histórico do botão anterior conserva as últimas 100 faixas.
 
+O `/play` identifica automaticamente vídeos, playlists e Mixes do YouTube:
+
+- Vídeo com tempo marcado: toca somente o vídeo a partir desse ponto, mesmo se o link também contiver `list`. Exemplo: `/play https://youtu.be/VIDEO_ID?t=90` inicia em **1min30s**. Aceita também `t=1m30s`, `start=90`, `#t=90` e `t=0`.
+- Playlist: um link `/playlist?list=...`, ou um vídeo com `list` sem tempo marcado, importa as faixas da playlist em ordem.
+- Mix: um link com `list=RD...` sem tempo marcado importa até **50 faixas** das recomendações retornadas pelo YouTube. O limite evita uma importação sem fim, pois Mixes são dinâmicos.
+
+Aceita os formatos `youtu.be`, `/watch`, Shorts, `/live`, `/embed` e YouTube Music. Links diretos de playlist mantêm a seleção da playlist.
+
 No botão **Pergaminho**, navegue pelas páginas e selecione uma música para tocar imediatamente. Ela sai da posição antiga, a faixa interrompida vai para o histórico e as demais continuam na mesma ordem. A seleção toca uma vez antes de retomar o restante, mesmo com o loop de uma faixa ativado.
 
 ### RPG, perfil e economia
@@ -161,8 +169,6 @@ APPLICATION_ID=id_da_aplicacao
 SPOTIFY_CLIENT_ID=
 SPOTIFY_CLIENT_SECRET=
 CUSTOM_DNS=true
-YOUTUBE_COOKIES_BROWSER=edge:Default
-YOUTUBE_YTDLP_PATH=
 ```
 
 | Variável | Obrigatória | Descrição |
@@ -174,21 +180,13 @@ YOUTUBE_YTDLP_PATH=
 | `SPOTIFY_CLIENT_ID` | Não | Client ID da API oficial do Spotify. |
 | `SPOTIFY_CLIENT_SECRET` | Não | Client secret da API oficial do Spotify. |
 | `CUSTOM_DNS` | Não | `true` força DNS público; `false` desativa o fallback de DNS do MongoDB. |
-| `YOUTUBE_COOKIES_BROWSER` | Não | Navegador e perfil usados para exportar cookies. Padrão: `edge:Default`. |
-| `YOUTUBE_YTDLP_PATH` | Não | Caminho alternativo para o executável do yt-dlp. |
 | `NO_COLOR` | Não | Desativa as cores ANSI do painel do terminal. |
 
 Nunca publique `.env`, tokens, credenciais do MongoDB ou cookies do navegador. Esses arquivos já estão cobertos pelo `.gitignore` do projeto.
 
-## Vídeos com restrição de idade
+## Reprodução do YouTube
 
-Faça login no YouTube pelo navegador configurado, feche-o completamente e execute:
-
-```powershell
-npm run cookies:youtube
-```
-
-O comando mantém somente cookies dos domínios YouTube e Google e grava o resultado em `src/commands/commands-audios/cookies.txt`. O arquivo é local e não será enviado ao Git.
+O bot reproduz o YouTube sem login e sem importar sessões do navegador. Vídeos que exigem autenticação ou confirmação de idade podem ficar indisponíveis.
 
 Se o Windows bloquear o executável, abra as propriedades de `src/commands/commands-audios/yt-dlp.exe`, marque **Desbloquear** e aplique a alteração.
 
@@ -201,7 +199,6 @@ Se o Windows bloquear o executável, abra as propriedades de `src/commands/comma
 | `npm run deploy:commands` | Publica a lista atual de slash commands globais. |
 | `npm run validate` | Valida carregamento, nomes duplicados e estrutura dos comandos. |
 | `npm run lint` | Executa o ESLint no projeto. |
-| `npm run cookies:youtube` | Atualiza os cookies locais utilizados pelo yt-dlp. |
 
 Antes de enviar alterações ao Git:
 
@@ -225,7 +222,7 @@ Bot/
 ├── app.js                       # Inicialização, MongoDB e handlers globais
 ├── config.js                    # Validação das credenciais principais
 ├── slashBuilder.js              # Publicação dos slash commands
-├── scripts/                     # Validação e cookies do YouTube
+├── scripts/                     # Validação dos comandos
 ├── logs/                        # Registro local de erros
 └── src/
     ├── assets/cards/            # Artes das cartas
